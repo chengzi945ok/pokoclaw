@@ -7,7 +7,7 @@ import {
   parseConservativeBashCommandSequence,
 } from "@/src/security/bash-prefix.js";
 import { buildSystemPolicy } from "@/src/security/policy.js";
-import { executeFullAccessSandboxedBash, executeSandboxedBash } from "@/src/security/sandbox.js";
+import { executeSandboxedBash, executeUnsandboxedBash } from "@/src/security/sandbox.js";
 import { SecurityService } from "@/src/security/service.js";
 import { toolApprovalRequired, toolRecoverableError } from "@/src/tools/core/errors.js";
 import { defineTool, type ToolExecutionContext, textToolResult } from "@/src/tools/core/types.js";
@@ -41,7 +41,7 @@ export const BASH_TOOL_SCHEMA = Type.Object(
       Type.Union([Type.Literal("sandboxed"), Type.Literal("full_access")], {
         default: "sandboxed",
         description:
-          "Execution mode. Use sandboxed by default. Use full_access only when this command genuinely needs broader shell execution than the default sandbox.",
+          "Execution mode. Use sandboxed by default. Use full_access only when this command genuinely needs approved host execution outside the sandbox.",
       }),
     ),
     justification: Type.Optional(
@@ -83,7 +83,7 @@ export function createBashTool() {
   return defineTool({
     name: "bash",
     description:
-      "Run a shell command in sandboxed or full_access mode. By default it runs sandboxed and returns a structured <bash_result> block with command, cwd, exit_code, stdout, and stderr. The default timeout is 10 seconds. You may override it with timeoutSec, but main chat agents cannot request more than 60 seconds; use a subagent for longer work. If broader shell execution than the default sandbox is genuinely necessary, rerun with sandboxMode=full_access and justification. When repeated simple task-aligned command families are likely, consider prefix so similar bash calls can reuse approval.",
+      "Run a shell command in sandboxed or full_access mode. By default it runs sandboxed and returns a structured <bash_result> block with command, cwd, exit_code, stdout, and stderr. The default timeout is 10 seconds. You may override it with timeoutSec, but main chat agents cannot request more than 60 seconds; use a subagent for longer work. If approved host execution outside the sandbox is genuinely necessary, rerun with sandboxMode=full_access and justification. When repeated simple task-aligned command families are likely, consider prefix so similar bash calls can reuse approval.",
     inputSchema: BASH_TOOL_SCHEMA,
     getInvocationTimeoutMs: getBashInvocationTimeoutMs,
     async execute(context, args) {
@@ -221,7 +221,7 @@ async function executeBashWithFullAccessIfAllowed(input: {
     input.context.approvalState?.bashFullAccess?.approved === true ||
     input.context.approvalState?.runtimeModeAutoApproval != null
   ) {
-    return await executeFullAccessSandboxedBash({
+    return await executeUnsandboxedBash({
       context: input.context,
       command: input.args.command,
       timeoutMs: input.timeoutMs,
@@ -241,7 +241,7 @@ async function executeBashWithFullAccessIfAllowed(input: {
       return access.result === "allow";
     });
     if (hasFullAccess) {
-      return await executeFullAccessSandboxedBash({
+      return await executeUnsandboxedBash({
         context: input.context,
         command: input.args.command,
         timeoutMs: input.timeoutMs,
@@ -320,7 +320,7 @@ function buildRequiresJustificationMessage(args: BashToolArgs): string {
   return [
     "bash full_access requires `justification`.",
     "",
-    "`justification` is required because full access uses a higher-permission sandbox. It should briefly explain why this exact command is necessary for the current user request.",
+    "`justification` is required because full access runs as approved host execution outside the sandbox. It should briefly explain why this exact command is necessary for the current user request.",
     "",
     "Use this exact bash argument object on the next retry:",
     "```json",

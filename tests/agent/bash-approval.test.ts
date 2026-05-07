@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-const { executeSandboxedBashMock, executeFullAccessSandboxedBashMock } = vi.hoisted(() => ({
+const { executeSandboxedBashMock, executeUnsandboxedBashMock } = vi.hoisted(() => ({
   executeSandboxedBashMock: vi.fn(),
-  executeFullAccessSandboxedBashMock: vi.fn(),
+  executeUnsandboxedBashMock: vi.fn(),
 }));
 
 import type { AgentAssistantContentBlock } from "@/src/agent/llm/messages.js";
@@ -31,7 +31,7 @@ vi.mock("@/src/security/sandbox.js", async () => {
   return {
     ...actual,
     executeSandboxedBash: executeSandboxedBashMock,
-    executeFullAccessSandboxedBash: executeFullAccessSandboxedBashMock,
+    executeUnsandboxedBash: executeUnsandboxedBashMock,
   };
 });
 
@@ -120,7 +120,7 @@ describe("agent loop bash approval flow", () => {
 
   beforeEach(() => {
     executeSandboxedBashMock.mockReset();
-    executeFullAccessSandboxedBashMock.mockReset();
+    executeUnsandboxedBashMock.mockReset();
   });
 
   afterEach(async () => {
@@ -223,7 +223,7 @@ describe("agent loop bash approval flow", () => {
         },
       }),
     );
-    executeFullAccessSandboxedBashMock.mockResolvedValueOnce({
+    executeUnsandboxedBashMock.mockResolvedValueOnce({
       command: "echo hi > notes.txt",
       cwd: "/tmp",
       timeoutMs: 10_000,
@@ -267,7 +267,7 @@ describe("agent loop bash approval flow", () => {
     const result = await runPromise;
 
     expect(executeSandboxedBashMock).toHaveBeenCalledTimes(1);
-    expect(executeFullAccessSandboxedBashMock).toHaveBeenCalledTimes(1);
+    expect(executeUnsandboxedBashMock).toHaveBeenCalledTimes(1);
     expect(result.events.some((event) => event.type === "approval_requested")).toBe(true);
     expect(
       result.events.some(
@@ -302,173 +302,6 @@ describe("agent loop bash approval flow", () => {
         {
           type: "text",
           text: expect.stringContaining("<bash_result>"),
-        },
-      ]),
-    });
-  });
-
-  test("explains when the retried bash call hits a new permission boundary", async () => {
-    handle = await createTestDatabase(import.meta.url);
-    seedConversationAndAgentFixture(handle);
-
-    const sessionsRepo = new SessionsRepo(handle.storage.db);
-    const messagesRepo = new MessagesRepo(handle.storage.db);
-    sessionsRepo.create({
-      id: "sess_1",
-      conversationId: "conv_1",
-      branchId: "branch_1",
-      ownerAgentId: "agent_1",
-      purpose: "chat",
-      createdAt: new Date("2026-03-22T00:00:00.000Z"),
-    });
-    messagesRepo.append({
-      id: "msg_user",
-      sessionId: "sess_1",
-      seq: 1,
-      role: "user",
-      payloadJson: '{"content":"write the note"}',
-      createdAt: new Date("2026-03-22T00:00:01.000Z"),
-    });
-
-    let modelTurnCount = 0;
-    const runner: AgentModelRunner = {
-      async runTurn() {
-        modelTurnCount += 1;
-        if (modelTurnCount === 1) {
-          return makeAssistantResult({
-            stopReason: "toolUse",
-            content: [
-              {
-                type: "toolCall",
-                id: "tool_1",
-                name: "bash",
-                arguments: {
-                  command: "cat /tmp/one && cat /tmp/two",
-                },
-              },
-            ],
-          });
-        }
-
-        if (modelTurnCount === 2) {
-          return makeAssistantResult({
-            stopReason: "toolUse",
-            content: [
-              {
-                type: "toolCall",
-                id: "tool_2",
-                name: "bash",
-                arguments: {
-                  command: "cat /tmp/one && cat /tmp/two",
-                  sandboxMode: "full_access",
-                  justification: "Need to read the requested files.",
-                },
-              },
-            ],
-          });
-        }
-
-        return makeAssistantResult({
-          content: [{ type: "text", text: "done" }],
-        });
-      },
-    };
-
-    executeSandboxedBashMock.mockRejectedValueOnce(
-      toolRecoverableError("Read access is missing for /tmp/one", {
-        code: "permission_denied",
-        requestable: true,
-        failedToolCallId: "tool_1",
-        summary: "Read access is missing for /tmp/one",
-        guidance:
-          'Decide whether this bash failure is really a shell-execution problem or whether the task should use structured tools plus request_permissions instead.\nIf the real need is access to business files or directories, prefer structured tools plus request_permissions.\nIf the real need is broader shell execution, command-supporting files, config, metadata, or other execution-layer dependencies, rerun bash with sandboxMode="full_access".\nA full-access bash retry must include justification.\nIf you expect repeated use of the same simple command family, consider adding prefix so the user does not need to re-approve similar bash calls.\nDo not use prefix for compound shell commands.\nIf full access is not necessary, do not request escalation.',
-        entries: [
-          {
-            resource: "filesystem",
-            path: "/tmp/one",
-            scope: "exact",
-            access: "read",
-          },
-        ],
-        bashContext: {
-          command: "cat /tmp/one && cat /tmp/two",
-          cwd: "/tmp",
-          exitCode: 1,
-          signal: null,
-          stdout: "",
-          stderr: "permission denied",
-        },
-      }),
-    );
-    executeFullAccessSandboxedBashMock.mockRejectedValueOnce(
-      toolRecoverableError("Read access is missing for /tmp/two", {
-        code: "permission_denied",
-        requestable: true,
-        failedToolCallId: "tool_2",
-        summary: "Read access is missing for /tmp/two",
-        guidance:
-          'Decide whether this bash failure is really a shell-execution problem or whether the task should use structured tools plus request_permissions instead.\nIf the real need is access to business files or directories, prefer structured tools plus request_permissions.\nIf the real need is broader shell execution, command-supporting files, config, metadata, or other execution-layer dependencies, rerun bash with sandboxMode="full_access".\nA full-access bash retry must include justification.\nIf you expect repeated use of the same simple command family, consider adding prefix so the user does not need to re-approve similar bash calls.\nDo not use prefix for compound shell commands.\nIf full access is not necessary, do not request escalation.',
-        entries: [
-          {
-            resource: "filesystem",
-            path: "/tmp/two",
-            scope: "exact",
-            access: "read",
-          },
-        ],
-        bashContext: {
-          command: "cat /tmp/one && cat /tmp/two",
-          cwd: "/tmp",
-          exitCode: 1,
-          signal: null,
-          stdout: "",
-          stderr: "permission denied",
-        },
-      }),
-    );
-
-    const tools = new ToolRegistry([createBashTool()]);
-    const emittedEvents: Array<{ type: string; approvalId?: string; decision?: string }> = [];
-    const loop = new AgentLoop({
-      sessions: new AgentSessionService(sessionsRepo, messagesRepo),
-      messages: messagesRepo,
-      models: new ProviderRegistry(createModelConfig()),
-      tools,
-      cancel: new SessionRunAbortRegistry(),
-      modelRunner: runner,
-      storage: handle.storage.db,
-      securityConfig: DEFAULT_CONFIG.security,
-      compaction: DEFAULT_CONFIG.compaction,
-      emitEvent(event) {
-        emittedEvents.push(event);
-      },
-    });
-
-    const runPromise = loop.run({ sessionId: "sess_1", scenario: "chat" });
-    const approvalId = Number(await waitForApprovalRequested(emittedEvents));
-
-    expect(
-      loop.submitApprovalResponse({
-        approvalId,
-        decision: "approve",
-        actor: "user",
-        rawInput: "approve",
-        grantedBy: "user",
-        expiresAt: null,
-      }),
-    ).toBe(true);
-
-    await runPromise;
-
-    const rows = messagesRepo.listBySession("sess_1");
-    expect(JSON.parse(rows[4]?.payloadJson ?? "{}")).toMatchObject({
-      toolCallId: "tool_2",
-      toolName: "bash",
-      isError: true,
-      content: expect.arrayContaining([
-        {
-          type: "text",
-          text: expect.stringContaining("<permission_block>"),
         },
       ]),
     });
