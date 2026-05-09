@@ -5,13 +5,18 @@
  * start runtime bootstrap, listen for shutdown signals, and perform graceful
  * teardown. Business logic lives in runtime/orchestration/channel modules.
  */
+import { SandboxManager } from "@danielwpz/sandbox-runtime";
+
 import { getDefaultConfigPaths, loadConfig } from "@/src/config/load.js";
+import type { AppConfig } from "@/src/config/schema.js";
 import { createRuntimeBootstrap } from "@/src/runtime/bootstrap.js";
 import { readLastRuntimeLogTimestamp } from "@/src/runtime/runtime-log.js";
+import { buildSystemPolicy } from "@/src/security/policy.js";
 import {
   configureRuntimeLogging,
   createBootstrapLogger,
   createSubsystemLogger,
+  shutdownRuntimeLogging,
 } from "@/src/shared/logger.js";
 import { POKOCLAW_RUNTIME_LOG_PATH } from "@/src/shared/paths.js";
 import type { StorageDatabase } from "@/src/storage/index.js";
@@ -25,6 +30,7 @@ export async function main(): Promise<void> {
 
   let storage: StorageDatabase | null = null;
   let runtime: ReturnType<typeof createRuntimeBootstrap> | null = null;
+  let sandboxRuntimeInitialized = false;
 
   try {
     const configPaths = getDefaultConfigPaths();
@@ -35,6 +41,9 @@ export async function main(): Promise<void> {
       providers: Object.keys(config.providers).length,
       models: config.models.catalog.length,
     });
+
+    await initializeSandboxRuntime(config.security);
+    sandboxRuntimeInitialized = true;
 
     storage = await initializeStorageOnStartup();
     runtime = createRuntimeBootstrap({
@@ -52,13 +61,24 @@ export async function main(): Promise<void> {
 
     await runtime.shutdown();
     runtime = null;
+    if (sandboxRuntimeInitialized) {
+      await SandboxManager.reset();
+      sandboxRuntimeInitialized = false;
+    }
     storage.close();
     storage = null;
     logger.info("shutdown complete", { signal });
+    await shutdownRuntimeLogging();
   } finally {
     if (runtime != null) {
       try {
         await runtime.shutdown();
+      } catch {}
+    }
+
+    if (sandboxRuntimeInitialized) {
+      try {
+        await SandboxManager.reset();
       } catch {}
     }
 
@@ -70,13 +90,40 @@ export async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  const bootstrapLogger = createBootstrapLogger({ subsystem: "bootstrap" });
-  bootstrapLogger.error("startup failed", {
-    error: error instanceof Error ? error.message : String(error),
+async function initializeSandboxRuntime(securityConfig: AppConfig["security"]): Promise<void> {
+  const systemPolicy = buildSystemPolicy({ security: securityConfig });
+  await SandboxManager.initialize({
+    filesystem: {
+      readMode: "deny_only",
+      denyRead: [],
+      allowRead: [],
+      allowWrite: [],
+      denyWrite: [],
+    },
+    network: {
+      mode: "deny_only",
+      allowedDomains: [],
+      deniedDomains: systemPolicy.network.hardDenyHosts,
+    },
   });
-  process.exitCode = 1;
-});
+  logger.info("sandbox runtime initialized", {
+    networkHardDenyHosts: systemPolicy.network.hardDenyHosts.length,
+  });
+}
+
+main()
+  .then(() => {
+    // The Lark SDK keeps an internal cache interval alive after WSClient.close().
+    process.exit(0);
+  })
+  .catch(async (error: unknown) => {
+    const bootstrapLogger = createBootstrapLogger({ subsystem: "bootstrap" });
+    bootstrapLogger.error("startup failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await shutdownRuntimeLogging().catch(() => {});
+    process.exit(1);
+  });
 
 function waitForShutdownSignal(): Promise<NodeJS.Signals> {
   return new Promise((resolve) => {
