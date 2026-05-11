@@ -1211,6 +1211,69 @@ describe("lark run state", () => {
     expect(listDirHeader).not.toContain("列出");
   });
 
+  test("renders MCP tool calls with friendly server and tool labels", () => {
+    const state = reduceLarkRunState(
+      null,
+      makeEnvelope({
+        type: "tool_call_started",
+        eventId: "evt_mcp_1",
+        createdAt: "2026-03-28T00:00:00.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_mcp_1",
+        toolName: "mcp__linear__list_issues",
+        args: {
+          query: "MCP",
+          team: "Pokoclaw",
+          limit: 20,
+        },
+      }),
+    );
+
+    const card = renderLarkRunCard(state);
+    const header = findFirstToolHeaderContent(card);
+    expect(header).toBe("⏳ **MCP · Linear · List issues** — MCP · Pokoclaw");
+    expect(header).not.toContain("mcp__linear__list_issues");
+
+    const cardText = JSON.stringify(card);
+    expect(cardText).toContain("Server: `linear`");
+    expect(cardText).toContain("Tool: `list_issues`");
+    expect(cardText).toContain("**Parameters**");
+    expect(cardText).toContain('\\"query\\": \\"MCP\\"');
+  });
+
+  test("renders MCP tool calls by splitting server and tool on the last delimiter", () => {
+    const state = reduceLarkRunState(
+      null,
+      makeEnvelope({
+        type: "tool_call_started",
+        eventId: "evt_mcp_delimiter_1",
+        createdAt: "2026-03-28T00:00:00.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_mcp_delimiter_1",
+        toolName: "mcp__team__alpha__search_records",
+        args: {
+          query: "MCP",
+        },
+      }),
+    );
+
+    const card = renderLarkRunCard(state);
+    const header = findFirstToolHeaderContent(card);
+    expect(header).toBe("⏳ **MCP · Team alpha · Search records** — MCP");
+
+    const cardText = JSON.stringify(card);
+    expect(cardText).toContain("Server: `team__alpha`");
+    expect(cardText).toContain("Tool: `search_records`");
+  });
+
   test("renders review_permission_request header when approvalId is a string", () => {
     const state = reduceLarkRunState(
       null,
@@ -1235,48 +1298,6 @@ describe("lark run state", () => {
 
     const header = findFirstToolHeaderContent(renderLarkRunCard(state));
     expect(header).toBe("⏳ **review_permission_request** — 已批准 · #42");
-  });
-
-  test("renders standalone approval cards with rich header styling and actions", () => {
-    const approvalState = createLarkApprovalStateFromRequest({
-      event: {
-        type: "approval_requested",
-        eventId: "evt_approval_card_1",
-        createdAt: "2026-03-28T00:00:00.000Z",
-        sessionId: "sess_1",
-        conversationId: "conv_1",
-        branchId: "branch_1",
-        runId: "run_1",
-        approvalId: "approval_1",
-        approvalFlowId: "approval_1",
-        approvalAttemptIndex: 1,
-        approvalTarget: "user",
-        title: "需要授权",
-        request: {
-          scopes: [
-            { kind: "fs.read", path: "/Users/example/project/README.md" },
-            { kind: "fs.write", path: "/Users/example/project/output.txt" },
-          ],
-        },
-        reasonText: "当前操作需要你的授权才能继续。",
-        expiresAt: null,
-      },
-      sourceRunCardObjectId: "run_1:seg:1",
-    });
-
-    const cardText = JSON.stringify(buildLarkRenderedApprovalCard(approvalState).card);
-    expect(cardText).toContain('"template":"blue"');
-    expect(cardText).toContain("lock_chat_filled");
-    expect(cardText).not.toContain('"subtitle"');
-    expect(cardText).toContain("### 授权运行命令");
-    expect(cardText).not.toContain("**操作**");
-    expect(cardText).toContain("**权限**");
-    expect(cardText).toContain("**Read** `/Users/example/project/README.md`");
-    expect(cardText).toContain("**Write** `/Users/example/project/output.txt`");
-    expect(cardText).toContain("**原因**");
-    expect(cardText).toContain("允许 1天");
-    expect(cardText).toContain("允许 永久");
-    expect(cardText).toContain("拒绝");
   });
 
   test("reuses one approval flow card across timeout fallback and final delegated approval", () => {

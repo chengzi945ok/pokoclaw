@@ -20,6 +20,10 @@ import type { LoadConfigOptions } from "@/src/config/load.js";
 import { ScenarioModelSwitchService } from "@/src/config/scenario-model-switch.js";
 import type { AppConfig } from "@/src/config/schema.js";
 import { CronService } from "@/src/cron/service.js";
+import { McpCatalogService } from "@/src/mcp/catalog.js";
+import { computeStableFingerprint } from "@/src/mcp/fingerprint.js";
+import { McpClientManager } from "@/src/mcp/manager.js";
+import { McpToolSource } from "@/src/mcp/tool-source.js";
 import { MeditationPipelineRunner } from "@/src/meditation/runner.js";
 import { MeditationScheduler } from "@/src/meditation/scheduler.js";
 import { AgentManager, type AgentManagerDependencies } from "@/src/orchestration/agent-manager.js";
@@ -48,6 +52,7 @@ import { MessagesRepo } from "@/src/storage/repos/messages.repo.js";
 import { SessionsRepo } from "@/src/storage/repos/sessions.repo.js";
 import { TaskRunsRepo } from "@/src/storage/repos/task-runs.repo.js";
 import { createBuiltinToolRegistry } from "@/src/tools/builtins.js";
+import { CompositeToolRegistry } from "@/src/tools/core/composite-registry.js";
 
 const logger = createSubsystemLogger("runtime-bootstrap");
 
@@ -59,11 +64,13 @@ export interface RuntimeBootstrap {
   readonly heartbeat: MinuteHeartbeat;
   readonly cron: CronService;
   readonly meditation: MeditationScheduler;
+  readonly mcp: McpClientManager;
+  readonly mcpCatalog: McpCatalogService;
   readonly lark: LarkChannelRuntime;
   readonly control: RuntimeControlService;
   readonly status: RuntimeStatusService;
   readonly outboundEventBus: RuntimeEventBus<OrchestratedOutboundEventEnvelope>;
-  start(): void;
+  start(): Promise<void>;
   shutdown(): Promise<void>;
 }
 
@@ -80,6 +87,9 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
     initialSnapshot: input.config,
     ...(input.configPaths == null ? {} : { filePaths: input.configPaths }),
   });
+  const mcp = new McpClientManager({ config: input.config.mcp });
+  const mcpCatalog = new McpCatalogService({ manager: mcp });
+  const mcpTools = new McpToolSource({ manager: mcp, catalog: mcpCatalog });
   const liveModels = new LiveProviderRegistrySource(liveConfig);
   const messages = new MessagesRepo(input.storage);
   const sessions = new SessionsRepo(input.storage);
@@ -87,7 +97,7 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
     listConfiguredLarkInstallations(input.config.channels.lark),
   );
   let a2ui: LarkA2uiService | null = null;
-  const tools = createBuiltinToolRegistry(
+  const builtinTools = createBuiltinToolRegistry(
     {
       providers: input.config.providers,
       tools: input.config.tools,
@@ -103,6 +113,7 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
       },
     },
   );
+  const tools = new CompositeToolRegistry([builtinTools, mcpTools]);
   const bridge = createRuntimeOrchestrationBridge();
   const outboundEventBus = new RuntimeEventBus<OrchestratedOutboundEventEnvelope>();
   const cancel = new SessionRunAbortRegistry();
@@ -123,6 +134,7 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
     control,
     models: liveModels,
     runtimeModes,
+    mcp,
   });
   const loop = new AgentLoop({
     sessions: new AgentSessionService(sessions, messages),
@@ -227,7 +239,33 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
   });
 
   let started = false;
+  let starting: Promise<void> | null = null;
   let shuttingDown: Promise<void> | null = null;
+  let mcpConfigFingerprint = computeStableFingerprint(input.config.mcp);
+  const unsubscribeMcpConfig = liveConfig.subscribe((event) => {
+    const nextMcpConfigFingerprint = computeStableFingerprint(event.snapshot.mcp);
+    if (nextMcpConfigFingerprint === mcpConfigFingerprint) {
+      logger.debug("mcp config reload skipped because mcp snapshot was unchanged", {
+        reason: event.reason,
+        version: event.version,
+      });
+      return;
+    }
+
+    void mcp
+      .reload(event.snapshot.mcp, event.reason)
+      .then(async () => {
+        mcpConfigFingerprint = nextMcpConfigFingerprint;
+        await mcpCatalog.refreshAll();
+      })
+      .catch((error: unknown) => {
+        logger.warn("mcp config reload failed", {
+          reason: event.reason,
+          version: event.version,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  });
 
   return {
     bridge,
@@ -237,6 +275,8 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
     heartbeat,
     cron,
     meditation,
+    mcp,
+    mcpCatalog,
     lark,
     control,
     status,
@@ -244,7 +284,7 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
     start() {
       if (started) {
         logger.debug("runtime bootstrap start skipped because it is already running");
-        return;
+        return starting ?? Promise.resolve();
       }
 
       let preparedBackOnline: PreparedBackOnlineRecovery = {
@@ -265,6 +305,24 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
       }
 
       liveConfig.startWatching();
+      starting = mcp
+        .start()
+        .then(() => {
+          void mcpCatalog.refreshAll().catch((error: unknown) => {
+            logger.warn("mcp startup catalog refresh failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        })
+        .catch((error: unknown) => {
+          logger.warn("mcp manager startup failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        })
+        .finally(() => {
+          starting = null;
+        });
       lark.start();
       cron.start();
       meditation.start();
@@ -274,6 +332,7 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
         providerCount: Object.keys(input.config.providers).length,
         modelCount: input.config.models.catalog.length,
         toolCount: tools.list().length,
+        mcpServers: Object.keys(input.config.mcp.servers).length,
         larkInstallations: lark.status().configuredInstallations,
       });
 
@@ -286,6 +345,8 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
           error: error instanceof Error ? error.message : String(error),
         });
       });
+
+      return starting;
     },
     shutdown() {
       if (shuttingDown != null) {
@@ -304,8 +365,10 @@ export function createRuntimeBootstrap(input: CreateRuntimeBootstrapInput): Runt
           inFlightMeditationRuns: meditation.status().inFlightRuns,
         });
         heartbeat.stop();
+        unsubscribeMcpConfig();
         a2ui?.shutdown();
         await lark.shutdown();
+        await mcp.shutdown();
         meditation.stop();
         cron.stop();
         await meditation.drain();
