@@ -1824,6 +1824,104 @@ describe("lark run state", () => {
     expect(header).not.toContain("echo first line\\n");
   });
 
+  test("keeps failed tool titles to the first non-empty error line", () => {
+    let state = reduceLarkRunState(
+      null,
+      makeEnvelope({
+        type: "tool_call_started",
+        eventId: "evt_failed_tool_started_1",
+        createdAt: "2026-03-28T00:00:00.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_bash_failed_1",
+        toolName: "bash",
+        args: {
+          command: "pnpm test",
+          sandboxMode: "full_access",
+        },
+      }),
+    );
+    state = reduceLarkRunState(
+      state,
+      makeEnvelope({
+        type: "tool_call_failed",
+        eventId: "evt_failed_tool_failed_1",
+        createdAt: "2026-03-28T00:00:01.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_bash_failed_1",
+        toolName: "bash",
+        errorKind: "recoverable_error",
+        retryable: true,
+        errorMessage:
+          "This simple bash `full_access` call has no `prefix`.\n\n`prefix` is the reusable approval scope: after approval, later commands can reuse the grant.",
+        rawErrorMessage:
+          "This simple bash `full_access` call has no `prefix`.\n\n`prefix` is the reusable approval scope: after approval, later commands can reuse the grant.",
+      }),
+    );
+
+    const card = renderLarkRunCard(state);
+    const header = findFirstToolHeaderContent(card);
+    expect(header).toBe("❌ **bash** — This simple bash `full_access` call has no `prefix`.");
+    expect(header).not.toContain("\n");
+    expect(header).not.toContain("reusable approval scope");
+
+    const cardText = JSON.stringify(card);
+    expect(cardText).toContain("reusable approval scope");
+  });
+
+  test("normalizes failed non-bash tool titles to a single summary line", () => {
+    let state = reduceLarkRunState(
+      null,
+      makeEnvelope({
+        type: "tool_call_started",
+        eventId: "evt_failed_generic_started_1",
+        createdAt: "2026-03-28T00:00:00.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_generic_failed_1",
+        toolName: "custom_tool",
+        args: {
+          query: "example",
+        },
+      }),
+    );
+    state = reduceLarkRunState(
+      state,
+      makeEnvelope({
+        type: "tool_call_failed",
+        eventId: "evt_failed_generic_failed_1",
+        createdAt: "2026-03-28T00:00:01.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        toolCallId: "tool_generic_failed_1",
+        toolName: "custom_tool",
+        errorKind: "recoverable_error",
+        retryable: true,
+        errorMessage: "\n\nPrimary failure line.\n\nDetailed repair instructions.",
+        rawErrorMessage: "\n\nPrimary failure line.\n\nDetailed repair instructions.",
+      }),
+    );
+
+    const card = renderLarkRunCard(state);
+    const header = findFirstToolHeaderContent(card);
+    expect(header).toBe("❌ **custom_tool** — Primary failure line.");
+    expect(header).not.toContain("\n");
+    expect(header).not.toContain("Detailed repair instructions");
+  });
+
   test("renders terminal failure details even when no transcript blocks exist", () => {
     let state = reduceLarkRunState(
       null,

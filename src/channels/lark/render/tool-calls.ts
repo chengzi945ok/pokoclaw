@@ -278,7 +278,7 @@ function renderPermissionRequestToolDetailContent(tool: LarkToolSequenceTool): s
 
 function summarizeToolHeader(tool: LarkToolSequenceTool): string {
   if (tool.status === "failed") {
-    return truncateText(tool.errorMessage ?? "Tool failed", 80);
+    return summarizeFailedToolError(tool.errorMessage ?? "Tool failed");
   }
 
   const args = isRecord(tool.args) ? tool.args : null;
@@ -317,6 +317,15 @@ function summarizeToolHeader(tool: LarkToolSequenceTool): string {
     default:
       return summarizeGeneric(args);
   }
+}
+
+function summarizeFailedToolError(errorMessage: string): string {
+  const firstNonEmptyLine =
+    errorMessage
+      .split(/\r?\n/u)
+      .map((line) => normalizeSingleLine(line))
+      .find((line) => line.length > 0) ?? "Tool failed";
+  return truncateText(firstNonEmptyLine, 80);
 }
 
 function summarizeScheduleTask(args: Record<string, unknown> | null): string {
