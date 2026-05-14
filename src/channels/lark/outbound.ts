@@ -48,6 +48,7 @@ import {
   shouldHandleLarkTaskRunEvent,
 } from "@/src/channels/lark/run-state.js";
 import type { LarkSteerReactionState } from "@/src/channels/lark/steer-reaction-state.js";
+import { sendLarkTextMessage } from "@/src/channels/lark/text-message.js";
 import type {
   OrchestratedOutboundEventEnvelope,
   OrchestratedRuntimeEventEnvelope,
@@ -72,6 +73,8 @@ const LARK_CARDKIT_RECONCILE_RETRY_DELAY_MS = 1000;
 const TASK_STATUS_DELIVERY_PREFIX = "task_status:";
 const STEER_CONFIRMED_REACTION_EMOJI = "OK";
 const LARK_OUTBOUND_DEPENDENCY_RETRY_DELAY_MS = 1_000;
+const FEISHU_DOC_URL_PATTERN =
+  /https?:\/\/(?:[A-Za-z0-9-]+\.)*(?:feishu\.cn|larksuite\.com)\/(?:docx|docs|wiki)\/[^\s<>"'`)\],，。！？；：、]+/g;
 
 interface LarkCardElementContentInput {
   path: {
@@ -155,6 +158,7 @@ export function createLarkOutboundRuntime(
   const deliveryVersions = new Map<string, number>();
   const flushing = new Set<string>();
   const urgentFlushes = new Set<string>();
+  const sentDocPreviewKeys = new Set<string>();
   let unsubscribe: (() => void) | null = null;
 
   const scheduleFlush = (
@@ -515,6 +519,8 @@ export function createLarkOutboundRuntime(
         existingBindings.map((binding) => [binding.internalObjectId, binding]),
       );
       const deliveredPageObjectIds = new Set<string>();
+      let hasDeliveredRunCard = existingBindings.some((binding) => binding.larkMessageId != null);
+      let shouldDeferDocPreview = false;
 
       for (const renderedPage of renderedPages) {
         const pageObjectId = buildRunCardPageObjectId(runCardObjectId, renderedPage.pageIndex);
@@ -601,10 +607,12 @@ export function createLarkOutboundRuntime(
             },
           });
           if (binding == null) {
+            shouldDeferDocPreview = true;
             continue;
           }
 
           existingBindingsByObjectId.set(pageObjectId, binding);
+          hasDeliveredRunCard = hasDeliveredRunCard || binding.larkMessageId != null;
           deliverySnapshots.set(snapshotKey, {
             structureSignature: renderedPage.structureSignature,
             activeAssistantElementId: activeAssistantBlockId,
@@ -660,6 +668,7 @@ export function createLarkOutboundRuntime(
               }),
           });
           if (mutation.kind === "reconcile") {
+            shouldDeferDocPreview = true;
             scheduleCardkitSequenceReconcile({
               bindingsRepo,
               channelInstallationId: target.channelInstallationId,
@@ -742,6 +751,7 @@ export function createLarkOutboundRuntime(
             }),
         });
         if (mutation.kind === "reconcile") {
+          shouldDeferDocPreview = true;
           scheduleCardkitSequenceReconcile({
             bindingsRepo,
             channelInstallationId: target.channelInstallationId,
@@ -834,6 +844,7 @@ export function createLarkOutboundRuntime(
             }),
         });
         if (mutation.kind === "reconcile") {
+          shouldDeferDocPreview = true;
           scheduleCardkitSequenceReconcile({
             bindingsRepo,
             channelInstallationId: target.channelInstallationId,
@@ -874,6 +885,26 @@ export function createLarkOutboundRuntime(
           channelInstallationId: target.channelInstallationId,
           larkCardId: binding.larkCardId,
           sequence,
+        });
+      }
+
+      if (hasDeliveredRunCard && !shouldDeferDocPreview) {
+        await maybeSendFeishuDocPreviewMessages({
+          channelInstallationId: target.channelInstallationId,
+          chatId,
+          client,
+          runCardObjectId,
+          sentDocPreviewKeys,
+          state,
+          surfaceObject:
+            state.taskRunId != null &&
+            shouldRenderStandaloneTaskCard(state.taskRunType) &&
+            taskRootBinding?.larkMessageId != null
+              ? {
+                  chat_id: chatId,
+                  reply_to_message_id: taskRootBinding.larkMessageId,
+                }
+              : surfaceObject,
         });
       }
     }
@@ -1929,6 +1960,7 @@ export function createLarkOutboundRuntime(
       latestRunSegmentByRunId.clear();
       nextRunSegmentIndexByRunId.clear();
       latestApprovalByRunId.clear();
+      sentDocPreviewKeys.clear();
       logger.info("lark outbound runtime shutdown complete");
     },
 
@@ -1951,6 +1983,90 @@ function parseSurfaceObject(raw: string): Record<string, unknown> {
   } catch {}
 
   return {};
+}
+
+async function maybeSendFeishuDocPreviewMessages(input: {
+  channelInstallationId: string;
+  chatId: string;
+  client: LarkSdkClient;
+  runCardObjectId: string;
+  sentDocPreviewKeys: Set<string>;
+  state: LarkRunState;
+  surfaceObject: Record<string, unknown>;
+}): Promise<void> {
+  if (!shouldSendFeishuDocPreviewForTerminal(input.state.terminal)) {
+    return;
+  }
+
+  const links = extractFeishuDocLinksFromLarkRunState(input.state);
+  if (links.length === 0) {
+    return;
+  }
+
+  const replyToMessageId = readStringValue(input.surfaceObject.reply_to_message_id);
+  const previewKey = JSON.stringify([
+    input.channelInstallationId,
+    input.chatId,
+    replyToMessageId ?? "",
+    input.runCardObjectId,
+  ]);
+  if (input.sentDocPreviewKeys.has(previewKey)) {
+    return;
+  }
+
+  await sendLarkTextMessage({
+    installationId: input.channelInstallationId,
+    chatId: input.chatId,
+    replyToMessageId,
+    text: links.join("\n"),
+    clients: {
+      getOrCreate: (installationId) => {
+        if (installationId !== input.channelInstallationId) {
+          throw new Error(`Unexpected lark installation id ${installationId}`);
+        }
+        return input.client;
+      },
+    },
+  });
+  input.sentDocPreviewKeys.add(previewKey);
+  logger.info("sent feishu doc preview text message after lark run card completion", {
+    channelInstallationId: input.channelInstallationId,
+    runId: input.state.runId,
+    runCardObjectId: input.runCardObjectId,
+    links,
+  });
+}
+
+function shouldSendFeishuDocPreviewForTerminal(terminal: LarkRunState["terminal"]): boolean {
+  return (
+    terminal === "completed" ||
+    terminal === "blocked" ||
+    terminal === "failed" ||
+    terminal === "cancelled" ||
+    terminal === "denied"
+  );
+}
+
+function extractFeishuDocLinksFromLarkRunState(state: LarkRunState): string[] {
+  const links = new Set<string>();
+  for (const block of state.blocks) {
+    if (block.kind !== "assistant_text") {
+      continue;
+    }
+
+    for (const match of block.text.matchAll(FEISHU_DOC_URL_PATTERN)) {
+      const link = normalizeFeishuDocLink(match[0]);
+      if (link != null) {
+        links.add(link);
+      }
+    }
+  }
+  return [...links];
+}
+
+function normalizeFeishuDocLink(link: string): string | null {
+  const normalized = link.trim().replace(/[.,;:!?，。！？；：]+$/u, "");
+  return normalized.length > 0 ? normalized : null;
 }
 
 async function sendLarkInteractiveCardReferenceMessage(input: {

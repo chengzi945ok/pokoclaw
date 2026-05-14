@@ -399,6 +399,168 @@ describe("lark outbound runtime", () => {
     await runtime.shutdown();
   });
 
+  test("sends feishu doc links as one trailing text message after run completion", async () => {
+    vi.useFakeTimers();
+    handle = await createTestDatabase(import.meta.url);
+    handle.storage.sqlite.exec(`
+      INSERT INTO channel_instances (id, provider, account_key, created_at, updated_at)
+      VALUES ('ci_lark_default', 'lark', 'default', '2026-03-28T00:00:00.000Z', '2026-03-28T00:00:00.000Z');
+
+      INSERT INTO conversations (id, channel_instance_id, external_chat_id, kind, created_at, updated_at)
+      VALUES ('conv_1', 'ci_lark_default', 'oc_chat_1', 'dm', '2026-03-28T00:00:00.000Z', '2026-03-28T00:00:00.000Z');
+
+      INSERT INTO conversation_branches (id, conversation_id, kind, branch_key, created_at, updated_at)
+      VALUES ('branch_1', 'conv_1', 'dm_main', 'main', '2026-03-28T00:00:00.000Z', '2026-03-28T00:00:00.000Z');
+    `);
+
+    new ChannelSurfacesRepo(handle.storage.db).upsert({
+      id: "surface_1",
+      channelType: "lark",
+      channelInstallationId: "default",
+      conversationId: "conv_1",
+      branchId: "branch_1",
+      surfaceKey: "chat:oc_chat_1",
+      surfaceObjectJson: JSON.stringify({ chat_id: "oc_chat_1" }),
+    });
+
+    const docLink1 = "https://www.feishu.cn/docx/C4DUdbOz9oiC7Qx8TBncxtevnXb";
+    const docLink2 = "https://openclaw.feishu.cn/wiki/AbCdEfGhIjKlMnOp";
+    const reasoningOnlyLink = "https://www.feishu.cn/docx/ReasoningOnlyDoc";
+    const expectedPreviewText = `${docLink1}\n${docLink2}`;
+
+    const createCard = vi.fn(async (_input: unknown) => ({
+      data: {
+        card_id: "card_1",
+      },
+    }));
+    let messageSendCount = 0;
+    const createMessage = vi.fn(async (_input: unknown) => {
+      messageSendCount += 1;
+      return {
+        data: {
+          message_id: messageSendCount === 1 ? "om_card_1" : "om_doc_preview_1",
+          open_message_id: messageSendCount === 1 ? "om_open_card_1" : "om_open_preview_1",
+        },
+      };
+    });
+    const updateCard = vi.fn(async (_input: unknown) => ({}));
+    const streamContent = vi.fn(async (_input: unknown) => ({}));
+    const bus = new RuntimeEventBus<OrchestratedOutboundEventEnvelope>();
+    const runtime = createLarkOutboundRuntime({
+      storage: handle.storage.db,
+      outboundEventBus: bus,
+      clients: {
+        getOrCreate: () =>
+          ({
+            sdk: {
+              cardkit: {
+                v1: {
+                  card: {
+                    create: createCard,
+                    update: updateCard,
+                  },
+                  cardElement: {
+                    content: streamContent,
+                  },
+                },
+              },
+              im: {
+                message: {
+                  create: createMessage,
+                },
+              },
+            },
+          }) as never,
+      },
+    });
+
+    runtime.start();
+
+    bus.publish(
+      makeEnvelope({
+        type: "assistant_message_completed",
+        eventId: "evt_doc_preview_1",
+        createdAt: "2026-03-28T00:00:00.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        turn: 1,
+        messageId: "msg_1",
+        text: `这里是文档：${docLink1}\n还有一个：${docLink2}，\n重复一次：${docLink1}`,
+        reasoningText: `thinking about ${reasoningOnlyLink}`,
+        toolCalls: [],
+        usage: null,
+      }),
+    );
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(createCard).toHaveBeenCalledOnce();
+    expect(createMessage).toHaveBeenCalledOnce();
+
+    bus.publish(
+      makeEnvelope({
+        type: "run_completed",
+        eventId: "evt_doc_preview_done",
+        createdAt: "2026-03-28T00:00:01.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        scenario: "chat",
+        modelId: "model_1",
+        appendedMessageIds: ["msg_1"],
+        toolExecutions: 0,
+        compactionRequested: false,
+      }),
+    );
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(createMessage).toHaveBeenCalledTimes(2);
+    expect(createMessage.mock.calls.at(1)?.[0]).toMatchObject({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: "oc_chat_1",
+        msg_type: "text",
+        content: JSON.stringify({ text: expectedPreviewText }),
+      },
+    });
+    const previewPayload = createMessage.mock.calls.at(1)?.[0] as
+      | { data?: { content?: string } }
+      | undefined;
+    const previewContent = JSON.parse(previewPayload?.data?.content ?? "{}") as { text?: string };
+    expect(previewContent.text).toBe(expectedPreviewText);
+    expect(previewContent.text).not.toContain(reasoningOnlyLink);
+
+    bus.publish(
+      makeEnvelope({
+        type: "run_completed",
+        eventId: "evt_doc_preview_done_retry",
+        createdAt: "2026-03-28T00:00:02.000Z",
+        sessionId: "sess_1",
+        conversationId: "conv_1",
+        branchId: "branch_1",
+        runId: "run_1",
+        scenario: "chat",
+        modelId: "model_1",
+        appendedMessageIds: ["msg_1"],
+        toolExecutions: 0,
+        compactionRequested: false,
+      }),
+    );
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(createMessage).toHaveBeenCalledTimes(2);
+
+    await runtime.shutdown();
+  });
+
   test("retries card.create once when card.create returns a non-zero code", async () => {
     vi.useFakeTimers();
     handle = await createTestDatabase(import.meta.url);
